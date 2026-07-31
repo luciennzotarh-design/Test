@@ -18,7 +18,19 @@ doesn't mean no API exists, it means they haven't built a connector for it.
 | Requirements | A Microsoft 365 subscription (admin access to activate/configure), Sage 200 Professional Summer 2018 Remastered / 2020 R1 or later |
 | Auth | OAuth 2.0 |
 | Older alternative | A "Classic" connection method exposing an IIS web server directly to the internet — more setup and larger attack surface, generally superseded by the Native API |
-| Still to confirm | The live API reference for Professional (`developer.sage.com/200-uk/apis/sage-200-professional`) returned a 403 during research and needs checking directly (with a developer account) to confirm the Purchase Order resource specifically supports **write/create**, not just read |
+| Base URL | `https://api.columbus.sage.com/uk/sage200extra/accounts/v1` (confirmed from the Sage 200 Professional OpenAPI spec) |
+
+**PO write support is confirmed.** From the actual OpenAPI spec (Sage 200 Professional API,
+version 2025.02):
+
+- `POST /pop_orders` (`operationId: PostPOPOrder`) creates a purchase order. Lines are
+  submitted **embedded in the same request** as a `lines[]` array — there's no separate
+  "create line" call needed for a straightforward PO.
+- `GET /pop_orders`, `PUT /pop_orders/{id}` also exist (list/update), plus
+  `POST /pop_orders_duplicate` for cloning an existing order.
+- `GET /suppliers` and `GET /products` exist as separate resources — needed because PO
+  fields reference suppliers/products by **internal numeric Sage ID**, not by the
+  human-readable account reference or product code (see mapping section below).
 
 This removes the need for an on-prem Windows agent or the SDK/Business Object Model —
 a hosted webhook receiver can call Sage 200 Professional's REST API in much the same way
@@ -42,7 +54,7 @@ sequenceDiagram
         WH-->>BC: Ack, no-op
     else new PO
         WH->>DB: Resolve supplier code, nominal codes, stock codes
-        WH->>SG: POST /purchase_orders (mapped payload, OAuth2)
+        WH->>SG: POST /pop_orders (mapped payload incl. lines[], OAuth2)
         SG-->>WH: Created (Sage PO number)
         WH->>DB: Store BigChange PO id <-> Sage PO number
         WH->>BC: (optional) write Sage PO number back to a BigChange custom field
@@ -58,21 +70,36 @@ The integration service itself can now be a normal hosted service (cloud functio
 container) — it doesn't need to live inside the customer's network, since the Sage 200
 Professional site is reachable via the Native API's Azure AD tunnel once that's configured.
 
-## Data mapping (draft — needs field-level confirmation)
+## Data mapping (BigChange → Sage `POST /pop_orders`)
 
-| BigChange PO field | Sage200 PO field | Notes |
+**Header (order-level) fields**, from the confirmed request schema:
+
+| BigChange PO field | Sage `pop_orders` field | Notes |
 |---|---|---|
-| PO number / external ID | Order reference | Also stored as the idempotency key |
-| Supplier | Supplier account code | Requires a supplier mapping table — BigChange supplier ≠ Sage supplier account code by default |
-| Order lines (item, qty, unit cost) | Order lines (stock/product code, qty, unit price) | Requires a product/stock code mapping table |
-| Job / site reference | Analysis code or order note | For cost-centre reporting back in Sage |
-| Delivery address | Delivery address | May default to a fixed warehouse/site address |
-| Nominal code (if set in BigChange) | Nominal code | Only if BigChange POs carry nominal coding; otherwise Sage's default per supplier/product applies |
+| PO number / external ID | `document_no` (or a spare/analysis field) | Also stored as the idempotency key |
+| Supplier | `supplier_id` (integer) | **Not** the supplier account code — must be resolved via `GET /suppliers` first and cached in a mapping table |
+| PO date | `document_date` | ISO 8601 |
+| Requested delivery date | `requested_delivery_date` | ISO 8601 |
+| Job / site reference | `analysis_code_1`..`analysis_code_20` (up to 20 free-form analysis slots) | For cost-centre reporting back in Sage — pick one slot by convention |
+| Delivery address | `delivery_address` (or `default_direct_delivery_address`) object — `address_1`..`address_4`, `city`, `county`, `postcode`, `contact`, etc. | May default to a fixed warehouse/site address |
+
+**Line fields** (submitted as a `lines[]` array in the same POST):
+
+| BigChange line field | Sage `pop_orders.lines[]` field | Notes |
+|---|---|---|
+| Item / product | `product_id` (integer) | **Not** the stock/product code — must be resolved via `GET /products` first and cached in a mapping table |
+| Quantity | `line_quantity` | |
+| Unit cost | `unit_buying_price` | |
+| Description | `description` (+ `use_description` flag) | |
+| Nominal code (if set in BigChange) | `nominal_reference`, `nominal_cost_centre`, `nominal_department` | Only if BigChange POs carry nominal coding; otherwise Sage's default per supplier/product applies |
+| Tax/VAT rate | `tax_code_id` (integer) | Also an internal ID — needs its own lookup/mapping |
 
 Suppliers and stock/product codes are assumed to **already exist in both systems** — this
-integration does not create master data, only transactional POs. A mapping table (BigChange
-ID → Sage200 code) is required for both suppliers and products before Phase 1 can run
-end-to-end.
+integration does not create master data, only transactional POs. Because Sage's API
+references them by internal numeric ID rather than the human-readable code, the
+integration needs a **lookup step** (`GET /suppliers`, `GET /products`, filtered/matched by
+code or name) before every push, with the resulting ID cached so it isn't re-resolved on
+every request.
 
 ## Key design points
 
@@ -93,21 +120,22 @@ end-to-end.
 
 ## Open questions to resolve before building
 
-1. **Purchase Order write support** — confirm via the actual Sage 200 Professional API
-   reference (needs a developer account/login, blocked during research) that purchase
-   orders can be **created**, not just read, and see the exact required/optional fields.
-2. **Native API already set up?** — has the customer's Sage 200 site already got the Azure
-   AD Proxy Connector and Microsoft 365 subscription in place, or does that need arranging
-   first (likely via their Sage partner)?
+1. ~~Purchase Order write support~~ — **Confirmed.** `POST /pop_orders` creates a PO with
+   embedded lines, per the Sage 200 Professional OpenAPI spec (v2025.02).
+2. **Native API already set up?** — Confirmed as already configured on the customer's Sage
+   200 site. Still need the actual OAuth2 client ID/secret from the Sage Developer account
+   being created.
 3. **BigChange webhook support** — does BigChange's API expose a `PurchaseOrder.Created`
    (or similar) webhook event, or does this need to be a scheduled poll instead? Check
    `bigchange.com/rest-api` / the BigChange developer portal, or ask BigChange support.
 4. **Supplier & product mapping ownership** — who maintains the BigChange↔Sage200 code
-   mapping tables, and how are they updated when new suppliers/products are added?
-5. **Nominal coding** — does BigChange capture nominal codes on a PO, or does Sage200's
+   mapping tables, and how are they updated when new suppliers/products are added? (Now more
+   concrete: this is a code/name → internal Sage numeric ID lookup, cached from `GET
+   /suppliers` and `GET /products`.)
+5. **Nominal coding** — does BigChange capture nominal codes on a PO, or does Sage's
    default coding per supplier/product apply?
-6. **Credentials** — confirm both a BigChange API key and a registered Sage 200 OAuth2
-   application (client id/secret) are available.
+6. **Credentials** — a BigChange API key is available. The Sage 200 OAuth2 client ID/secret
+   is pending (Sage Developer account being created).
 
 ## Suggested phased rollout
 
@@ -122,7 +150,7 @@ end-to-end.
 
 ## Next step
 
-Get a Sage developer account to confirm question 1 (PO write support) against the real API
-reference, and confirm question 2 (whether the Native API tunnel is already configured on
-the customer's Sage 200 site). Those two determine whether Phase 1 can start immediately or
-needs a setup step first.
+Get the Sage 200 OAuth2 client ID/secret from the Sage Developer app registration, and
+confirm question 3 (BigChange PO webhook support). Both API shapes are now known, so Phase 1
+(a script creating one real PO end-to-end) can be scaffolded as soon as credentials for both
+sides are available.
