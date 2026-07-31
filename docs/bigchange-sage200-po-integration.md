@@ -97,7 +97,7 @@ sequenceDiagram
 
     BC->>WH: POST webhook: type=purchaseOrder.created, data.entityId
     WH->>BC: GET /v1/finance/purchaseOrders/{entityId} (Bearer + Customer-Id)
-    WH->>BC: GET .../lineItems (separate call, not embedded)
+    WH->>BC: GET /v1/finance/purchaseorders/{entityId}/lineItems (paged, separate call)
     BC-->>WH: PO header + line items
     WH->>DB: Check idempotency (already pushed?)
     alt already pushed
@@ -130,9 +130,17 @@ Professional site is reachable via the Native API's Azure AD tunnel once that's 
 | `deliverySiteContactId` → (extra `GET` on Contacts) | `delivery_address` object | Requires a second lookup call; BigChange doesn't return address fields inline on the PO |
 | `clientNotes` / `internalNotes` | order note / memo | Optional |
 
-**Line fields** — BigChange's line items are a **separate resource** (not yet pulled in
-detail; only confirmed that create/get/update/delete endpoints exist). Once that schema is
-fetched, expect roughly:
+**Line fields** — BigChange's line items are a **separate, paginated resource**:
+`GET /v1/finance/purchaseorders/{purchaseOrderId}/lineItems` (scope `finance:read`,
+`Customer-Id` header required, same as the PO header call), returning
+`{ items: [...], pageNumber, pageSize, pageItemCount }`. Note the path uses lowercase
+`purchaseorders` here vs. `purchaseOrders` on the single-PO `GET` endpoint — likely just
+inconsistent docs rather than two real endpoints, but worth confirming empirically.
+
+The individual line-item **field schema itself wasn't shown** on this list page (the docs
+collapse it to `items: object[]`) — need the "Get a purchase order line item" or "Create a
+purchase order line item" page (which should show the full field list, the same way the
+single-PO `GET` page did) to get exact field names. Until then, expect roughly:
 
 | BigChange line field (to be confirmed) | Sage `pop_orders.lines[]` field | Notes |
 |---|---|---|
@@ -149,9 +157,9 @@ shares a common identifier for suppliers/products, the integration needs **two l
 tables**: BigChange `supplierId` → Sage `supplier_id`, and BigChange product reference →
 Sage `product_id` — both resolved once and cached, not re-matched on every push.
 
-**Still to pull**: the BigChange purchase-order line-item schema (exact field names) — the
-same way the header schema was just confirmed. That closes out the mapping table
-completely.
+**Still to pull**: the "Get a purchase order line item" (or "Create a purchase order line
+item") page for the exact line-item field names — that's the one piece left to close out
+the mapping table completely.
 
 ## Key design points
 
