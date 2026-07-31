@@ -37,6 +37,33 @@ a hosted webhook receiver can call Sage 200 Professional's REST API in much the 
 it would Sage 200 Standard's, once the Native API tunnel is set up on the Sage 200 server
 by the customer's IT/Sage partner.
 
+## Confirmed: BigChange Purchase Order API
+
+From the actual API reference (`developers.bigchange.com`):
+
+| | Detail |
+|---|---|
+| Base URL | `https://api.bigchange.com/v1` |
+| Get one PO | `GET /v1/finance/purchaseOrders/{purchaseOrderId}` (scope `finance:read`) |
+| Create/Update | `POST` / `PUT` on the same `purchaseOrders` collection also exist (confirmed via the nav: "Create an purchase order", "Update a purchase order") — not needed for this integration since we only read from BigChange, but useful to know if the write-back-of-status idea gets built later |
+| Auth | `Authorization: Bearer <token>` **and** a required `Customer-Id: <id>` header on every request — not just the token |
+| Line items | **Separate resource**, not embedded in the PO response — `GET`/`POST`/`PUT`/`DELETE` line-item endpoints exist under the purchase order (exact path not yet pulled, but the pattern from other resources is `/v1/finance/purchaseOrders/{id}/lineItems`) |
+
+**Confirmed PO header fields** (from the `GET` response schema):
+
+`id`, `jobId` (nullable — the BigChange job this PO relates to), `jobGroupId` (nullable),
+`contactId`, `seriesId` (nullable), `contractId` (nullable), `supplierId` (nullable —
+**this is the field to map to Sage's `supplier_id`**), `createdAt`, `reference` (string —
+**natural idempotency key**, maps to Sage's `document_no`), `currencyCode`,
+`deliverySiteContactId` (nullable — points at a Contact record, not raw address fields;
+resolving an actual delivery address means an extra Contacts lookup if needed),
+`clientNotes`, `internalNotes`, `sentAt`, `cancelledAt`, `receivedAt`, `cost`,
+`totalExclTax`, `totalInclTax`, `totalPaid`, `customFields[]`.
+
+No embedded lines and no embedded delivery address — both need a follow-up call, so
+fetching one PO fully is at minimum: `GET` the PO header, `GET` its line items, and
+(optionally) `GET` the delivery contact.
+
 ## Architecture
 
 **Webhook-triggered, confirmed against BigChange's actual webhook reference.** BigChange
@@ -69,8 +96,9 @@ sequenceDiagram
     participant SG as Sage 200 Professional<br/>(Native API, via Azure AD tunnel)
 
     BC->>WH: POST webhook: type=purchaseOrder.created, data.entityId
-    WH->>BC: GET /v1/purchaseOrders/{entityId} (fetch full PO)
-    BC-->>WH: PO details (supplier, lines, job ref, costs)
+    WH->>BC: GET /v1/finance/purchaseOrders/{entityId} (Bearer + Customer-Id)
+    WH->>BC: GET .../lineItems (separate call, not embedded)
+    BC-->>WH: PO header + line items
     WH->>DB: Check idempotency (already pushed?)
     alt already pushed
         WH-->>BC: 2xx ack, no-op
@@ -88,36 +116,42 @@ The integration service itself can now be a normal hosted service (cloud functio
 container) — it doesn't need to live inside the customer's network, since the Sage 200
 Professional site is reachable via the Native API's Azure AD tunnel once that's configured.
 
-## Data mapping (BigChange → Sage `POST /pop_orders`)
+## Data mapping (BigChange `purchaseOrders` → Sage `POST /pop_orders`)
 
-**Header (order-level) fields**, from the confirmed request schema:
+**Header (order-level) fields** — both sides now confirmed from real schemas:
 
-| BigChange PO field | Sage `pop_orders` field | Notes |
+| BigChange field | Sage `pop_orders` field | Notes |
 |---|---|---|
-| PO number / external ID | `document_no` (or a spare/analysis field) | Also stored as the idempotency key |
-| Supplier | `supplier_id` (integer) | **Not** the supplier account code — must be resolved via `GET /suppliers` first and cached in a mapping table |
-| PO date | `document_date` | ISO 8601 |
-| Requested delivery date | `requested_delivery_date` | ISO 8601 |
-| Job / site reference | `analysis_code_1`..`analysis_code_20` (up to 20 free-form analysis slots) | For cost-centre reporting back in Sage — pick one slot by convention |
-| Delivery address | `delivery_address` (or `default_direct_delivery_address`) object — `address_1`..`address_4`, `city`, `county`, `postcode`, `contact`, etc. | May default to a fixed warehouse/site address |
+| `reference` | `document_no` | Natural idempotency key on both ends |
+| `supplierId` | `supplier_id` (integer) | **Both are internal numeric IDs, but from different systems** — BigChange's `supplierId` must be resolved to Sage's `supplier_id` via a mapping table (there's no shared identifier, so this can't be a direct pass-through; needs matching by supplier name/account code set up once, then cached) |
+| `createdAt` | `document_date` | ISO 8601 on both sides |
+| — (not on PO header; would need `jobId` → job lookup if a requested delivery date exists on the job) | `requested_delivery_date` | BigChange's PO schema has no delivery-date field directly — check the job record via `jobId`, or leave unset |
+| `jobId` | `analysis_code_1`..`analysis_code_20` | Ties the Sage PO back to the originating BigChange job for cost-centre reporting |
+| `deliverySiteContactId` → (extra `GET` on Contacts) | `delivery_address` object | Requires a second lookup call; BigChange doesn't return address fields inline on the PO |
+| `clientNotes` / `internalNotes` | order note / memo | Optional |
 
-**Line fields** (submitted as a `lines[]` array in the same POST):
+**Line fields** — BigChange's line items are a **separate resource** (not yet pulled in
+detail; only confirmed that create/get/update/delete endpoints exist). Once that schema is
+fetched, expect roughly:
 
-| BigChange line field | Sage `pop_orders.lines[]` field | Notes |
+| BigChange line field (to be confirmed) | Sage `pop_orders.lines[]` field | Notes |
 |---|---|---|
-| Item / product | `product_id` (integer) | **Not** the stock/product code — must be resolved via `GET /products` first and cached in a mapping table |
+| Item / product reference | `product_id` (integer) | Requires its own `GET /products` lookup/mapping table on the Sage side |
 | Quantity | `line_quantity` | |
 | Unit cost | `unit_buying_price` | |
 | Description | `description` (+ `use_description` flag) | |
-| Nominal code (if set in BigChange) | `nominal_reference`, `nominal_cost_centre`, `nominal_department` | Only if BigChange POs carry nominal coding; otherwise Sage's default per supplier/product applies |
-| Tax/VAT rate | `tax_code_id` (integer) | Also an internal ID — needs its own lookup/mapping |
+| Nominal code (if BigChange line items carry one) | `nominal_reference`, `nominal_cost_centre`, `nominal_department` | Otherwise Sage's default per supplier/product applies |
+| Tax/VAT rate | `tax_code_id` (integer) | Also an internal Sage ID — needs its own lookup/mapping |
 
 Suppliers and stock/product codes are assumed to **already exist in both systems** — this
-integration does not create master data, only transactional POs. Because Sage's API
-references them by internal numeric ID rather than the human-readable code, the
-integration needs a **lookup step** (`GET /suppliers`, `GET /products`, filtered/matched by
-code or name) before every push, with the resulting ID cached so it isn't re-resolved on
-every request.
+integration does not create master data, only transactional POs. Because neither side
+shares a common identifier for suppliers/products, the integration needs **two lookup
+tables**: BigChange `supplierId` → Sage `supplier_id`, and BigChange product reference →
+Sage `product_id` — both resolved once and cached, not re-matched on every push.
+
+**Still to pull**: the BigChange purchase-order line-item schema (exact field names) — the
+same way the header schema was just confirmed. That closes out the mapping table
+completely.
 
 ## Key design points
 
