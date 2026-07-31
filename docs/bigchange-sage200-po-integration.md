@@ -131,35 +131,44 @@ Professional site is reachable via the Native API's Azure AD tunnel once that's 
 | `clientNotes` / `internalNotes` | order note / memo | Optional |
 
 **Line fields** — BigChange's line items are a **separate, paginated resource**:
-`GET /v1/finance/purchaseorders/{purchaseOrderId}/lineItems` (scope `finance:read`,
-`Customer-Id` header required, same as the PO header call), returning
-`{ items: [...], pageNumber, pageSize, pageItemCount }`. Note the path uses lowercase
-`purchaseorders` here vs. `purchaseOrders` on the single-PO `GET` endpoint — likely just
-inconsistent docs rather than two real endpoints, but worth confirming empirically.
+`GET /v1/finance/purchaseorders/{purchaseOrderId}/lineItems` to list, and
+`POST /v1/finance/purchaseorders/{purchaseOrderId}/lineItems` (scope `finance:write`) to
+create — both need the `Customer-Id` header, same as the PO header call. Confirmed field
+schema, from the create endpoint's request body:
 
-The individual line-item **field schema itself wasn't shown** on this list page (the docs
-collapse it to `items: object[]`) — need the "Get a purchase order line item" or "Create a
-purchase order line item" page (which should show the full field list, the same way the
-single-PO `GET` page did) to get exact field names. Until then, expect roughly:
+`contactId` (nullable), `quantity` (required), `description`, `taxId` (nullable),
+`unitCost` (nullable), `unitSellingPrice`, `nominalCodeId` (nullable), `departmentCodeId`
+(nullable).
 
-| BigChange line field (to be confirmed) | Sage `pop_orders.lines[]` field | Notes |
+**Important finding: BigChange PO lines have no product/stock catalog reference at
+all** — no `productId`, no stock code, nothing. They're free-text (`description`) plus
+cost/tax/nominal coding. This changes the plan: the "map BigChange product → Sage
+`product_id`" lookup table originally assumed likely **isn't needed** — instead, Sage lines
+should be created as **non-stock / free-text lines**, using whatever `line_type` Sage's API
+supports for that (the `pop_orders.lines[]` schema had both `product_id` and a separate
+`code`/`description` pair, suggesting non-stock lines are supported; the exact `line_type`
+enum values still need confirming — e.g. by checking Sage's reference-data endpoint for
+line types, or the desktop client's "non-stock item" PO entry option).
+
+| BigChange line field | Sage `pop_orders.lines[]` field | Notes |
 |---|---|---|
-| Item / product reference | `product_id` (integer) | Requires its own `GET /products` lookup/mapping table on the Sage side |
-| Quantity | `line_quantity` | |
-| Unit cost | `unit_buying_price` | |
-| Description | `description` (+ `use_description` flag) | |
-| Nominal code (if BigChange line items carry one) | `nominal_reference`, `nominal_cost_centre`, `nominal_department` | Otherwise Sage's default per supplier/product applies |
-| Tax/VAT rate | `tax_code_id` (integer) | Also an internal Sage ID — needs its own lookup/mapping |
+| `quantity` | `line_quantity` | Direct mapping |
+| `unitCost` | `unit_buying_price` | Direct mapping. (`unitSellingPrice` on BigChange has no Sage PO equivalent — POs are a buying document; ignore it here) |
+| `description` | `description` (+ `use_description: true`) | Direct mapping — this is the only "what is this line" data BigChange gives us |
+| `nominalCodeId` | `nominal_reference` | Both are internal IDs from different systems — needs its own mapping table (BigChange nominal code → Sage nominal code) |
+| `departmentCodeId` | `nominal_department` | Same — separate mapping table |
+| `taxId` | `tax_code_id` | Also two different internal ID systems — needs its own mapping table |
+| `contactId` (line-level) | — | Purpose unclear (a per-line contact, distinct from the PO's own `contactId`/`supplierId`) — likely not needed for the Sage push, flagged for later if it turns out to matter |
 
-Suppliers and stock/product codes are assumed to **already exist in both systems** — this
-integration does not create master data, only transactional POs. Because neither side
-shares a common identifier for suppliers/products, the integration needs **two lookup
-tables**: BigChange `supplierId` → Sage `supplier_id`, and BigChange product reference →
-Sage `product_id` — both resolved once and cached, not re-matched on every push.
+Suppliers are assumed to **already exist in both systems** and need one mapping table:
+BigChange `supplierId` → Sage `supplier_id`. Nominal codes, department codes, and tax
+codes each need their own small mapping table too (BigChange ID → Sage ID) — these are
+typically a fixed, short list (a handful of nominal codes, a handful of tax rates) that
+can be set up once as static config rather than looked up dynamically per push.
 
-**Still to pull**: the "Get a purchase order line item" (or "Create a purchase order line
-item") page for the exact line-item field names — that's the one piece left to close out
-the mapping table completely.
+**Remaining unknowns**: Sage's `line_type` values for non-stock lines (needed to actually
+build a working line payload), and whether BigChange signs webhook payloads. Both are
+small, targeted checks rather than open architecture questions at this point.
 
 ## Key design points
 
@@ -195,14 +204,18 @@ the mapping table completely.
 3. ~~BigChange webhook support~~ — **Confirmed.** `purchaseOrder.created` /
    `.modified` / `.deleted` are all available as webhook events. Still to check: whether
    payloads are signed for verification (see Key Design Points).
-4. **Supplier & product mapping ownership** — who maintains the BigChange↔Sage200 code
-   mapping tables, and how are they updated when new suppliers/products are added? (Now more
-   concrete: this is a code/name → internal Sage numeric ID lookup, cached from `GET
-   /suppliers` and `GET /products`.)
-5. **Nominal coding** — does BigChange capture nominal codes on a PO, or does Sage's
-   default coding per supplier/product apply?
+4. **Mapping table ownership** — who maintains the BigChange↔Sage200 ID mapping tables
+   (supplier, nominal code, department code, tax code), and how are they updated when new
+   ones are added on either side? Now concrete: 4 small static mapping tables, not one
+   dynamic lookup — confirmed there's no product/stock mapping needed (see below).
+5. ~~Nominal coding~~ — **Confirmed.** BigChange line items carry `nominalCodeId` and
+   `departmentCodeId` directly.
 6. **Credentials** — a BigChange API key is available. The Sage 200 OAuth2 client ID/secret
    is pending (Sage Developer account being created).
+7. **Sage `line_type` for non-stock lines** — BigChange PO lines have no product/stock
+   reference, only free-text description + cost. Need to confirm what `line_type` value (or
+   equivalent) Sage 200's `pop_orders.lines[]` expects for a non-stock/free-text line, since
+   `product_id` won't be available to send.
 
 ## Suggested phased rollout
 
