@@ -55,11 +55,10 @@ webhooks** in the developer portal. Confirmed details:
   queue accessible via their **FailedMessages** API — useful as a reconciliation backstop.
 - The API key needs `webhooks:read` + `webhooks:write` scopes, plus a `*:read` scope for
   every entity subscribed to.
-- **Still unconfirmed**: whether "purchase order" is actually in the list of subscribable
-  entities — the reference doc shows `job`, `contact`, `jobLineItem`, `worksheetAnswers` as
-  examples, not the full catalog. Check the entity dropdown when creating the webhook
-  subscription in the portal.
-- **Also unconfirmed**: whether webhook payloads are signed (e.g. HMAC) for verification —
+- **Confirmed**: `purchaseOrder.created`, `purchaseOrder.modified`, and
+  `purchaseOrder.deleted` are all available as subscribable events — checked directly in
+  the portal's webhook entity list.
+- **Still unconfirmed**: whether webhook payloads are signed (e.g. HMAC) for verification —
   not mentioned in the reference page seen so far.
 
 ```mermaid
@@ -84,10 +83,6 @@ sequenceDiagram
         WH-->>BC: 2xx ack
     end
 ```
-
-**Fallback if purchase orders aren't webhook-subscribable**: a scheduled poll (call the
-BigChange PO list endpoint filtered by `modifiedSince` every N minutes) — same downstream
-pipeline, just a different trigger.
 
 The integration service itself can now be a normal hosted service (cloud function or small
 container) — it doesn't need to live inside the customer's network, since the Sage 200
@@ -155,11 +150,9 @@ every request.
 2. **Native API already set up?** — Confirmed as already configured on the customer's Sage
    200 site. Still need the actual OAuth2 client ID/secret from the Sage Developer account
    being created.
-3. **BigChange webhook support** — the webhook *mechanism* is confirmed (general
-   entity+operation subscriptions, e.g. `job.created`). What's still unconfirmed is whether
-   **purchase order** is one of the subscribable entities — check the entity dropdown in
-   API Key Management → Manage webhooks in the portal. If not available, fall back to a
-   scheduled poll (doesn't block Phase 1 either way).
+3. ~~BigChange webhook support~~ — **Confirmed.** `purchaseOrder.created` /
+   `.modified` / `.deleted` are all available as webhook events. Still to check: whether
+   payloads are signed for verification (see Key Design Points).
 4. **Supplier & product mapping ownership** — who maintains the BigChange↔Sage200 code
    mapping tables, and how are they updated when new suppliers/products are added? (Now more
    concrete: this is a code/name → internal Sage numeric ID lookup, cached from `GET
@@ -171,18 +164,17 @@ every request.
 
 ## Suggested phased rollout
 
-1. **Phase 1 — manual/poll proof of concept**: a script that reads one known BigChange PO
-   and creates the matching Sage200 PO via a one-off run against the Sage 200 Professional
-   API. Validates field mapping and both APIs' auth without needing a hosted webhook
-   endpoint yet.
-2. **Phase 2 — automate the trigger**: move to a real webhook (or scheduled poll) with
-   idempotency and error handling.
+1. **Phase 1 — manual proof of concept**: a script that reads one known BigChange PO (by
+   ID, called manually) and creates the matching Sage200 PO via a one-off run against the
+   Sage 200 Professional API. Validates field mapping and both APIs' auth without needing a
+   hosted webhook endpoint yet.
+2. **Phase 2 — automate the trigger**: stand up the webhook receiver, subscribe to
+   `purchaseOrder.created`, add idempotency and async processing.
 3. **Phase 3 — monitoring & reconciliation**: alerting on failed pushes, a daily
    reconciliation report comparing BigChange POs to Sage200 POs to catch anything missed.
 
 ## Next step
 
-Get the Sage 200 OAuth2 client ID/secret from the Sage Developer app registration, and
-confirm question 3 (BigChange PO webhook support). Both API shapes are now known, so Phase 1
-(a script creating one real PO end-to-end) can be scaffolded as soon as credentials for both
-sides are available.
+Both APIs are now fully specced — the only remaining blocker is the Sage 200 OAuth2 client
+ID/secret from the Sage Developer app registration (pending, up to 72 hours). Once that
+lands, Phase 1 can be scaffolded as working code in this repo.
