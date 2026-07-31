@@ -39,44 +39,55 @@ by the customer's IT/Sage partner.
 
 ## Architecture
 
-**Defaulting to a scheduled poll, not a webhook.** BigChange's developer portal is
-currently unreachable for verification (blocked automated access during research), and one
-of their own API doc pages is labelled "coming soon" — suggesting their REST API may still
-be in phased rollout and webhook coverage for purchase orders is unconfirmed. Separately,
-BigChange's "DaaS" offering does expose purchase order data, but it's explicitly
-**read-only batch reporting** via Snowflake — not usable for triggering pushes. Until
-someone with portal access confirms a `PurchaseOrder.Created` webhook event exists, the
-safer build target is a poll.
+**Webhook-triggered, confirmed against BigChange's actual webhook reference.** BigChange
+has a general-purpose webhook system: you subscribe an API key to specific
+`entity.operation` event types (e.g. `job.created`) via **API Key Management → Manage
+webhooks** in the developer portal. Confirmed details:
+
+- Webhook payload is deliberately thin — `{ id, createdAt, sentAt, customerId, type,
+  data: { entityId } }`. It tells you *what changed*, not the full record; you then call
+  the entity's `GET /v1/{entity}/{entityId}` endpoint to fetch current state.
+- Child/line-item entities carry `parentEntityId`/`parentEntityType` in `data`, following
+  a pattern like `GET /v1/jobs/{jobId}/lineItems/{lineItemId}` — if purchase order lines
+  follow the same pattern, expect something similar for PO lines.
+- BigChange handles webhook delivery retries itself: exponential backoff, capped at 15
+  minutes between attempts, for up to 24 hours, then the message goes to a dead-letter
+  queue accessible via their **FailedMessages** API — useful as a reconciliation backstop.
+- The API key needs `webhooks:read` + `webhooks:write` scopes, plus a `*:read` scope for
+  every entity subscribed to.
+- **Still unconfirmed**: whether "purchase order" is actually in the list of subscribable
+  entities — the reference doc shows `job`, `contact`, `jobLineItem`, `worksheetAnswers` as
+  examples, not the full catalog. Check the entity dropdown when creating the webhook
+  subscription in the portal.
+- **Also unconfirmed**: whether webhook payloads are signed (e.g. HMAC) for verification —
+  not mentioned in the reference page seen so far.
 
 ```mermaid
 sequenceDiagram
-    participant SCHED as Scheduler<br/>(every N minutes)
-    participant WH as Integration Service
     participant BC as BigChange
+    participant WH as Integration Service<br/>(webhook receiver)
     participant DB as Mapping/State Store
     participant SG as Sage 200 Professional<br/>(Native API, via Azure AD tunnel)
 
-    SCHED->>WH: Tick
-    WH->>BC: GET purchase orders modified since last run
-    BC-->>WH: List of PO details (supplier, lines, job ref, costs)
-    loop each PO
-        WH->>DB: Check idempotency (already pushed?)
-        alt already pushed
-            WH->>WH: Skip
-        else new PO
-            WH->>DB: Resolve supplier code, nominal codes, stock codes
-            WH->>SG: POST /pop_orders (mapped payload incl. lines[], OAuth2)
-            SG-->>WH: Created (Sage PO number)
-            WH->>DB: Store BigChange PO id <-> Sage PO number
-            WH->>BC: (optional) write Sage PO number back to a BigChange custom field
-        end
+    BC->>WH: POST webhook: type=purchaseOrder.created, data.entityId
+    WH->>BC: GET /v1/purchaseOrders/{entityId} (fetch full PO)
+    BC-->>WH: PO details (supplier, lines, job ref, costs)
+    WH->>DB: Check idempotency (already pushed?)
+    alt already pushed
+        WH-->>BC: 2xx ack, no-op
+    else new PO
+        WH->>DB: Resolve supplier code, nominal codes, stock codes
+        WH->>SG: POST /pop_orders (mapped payload incl. lines[], OAuth2)
+        SG-->>WH: Created (Sage PO number)
+        WH->>DB: Store BigChange PO id <-> Sage PO number
+        WH->>BC: (optional) write Sage PO number back to a BigChange custom field
+        WH-->>BC: 2xx ack
     end
 ```
 
-If it turns out BigChange **does** have a working `PurchaseOrder.Created` (or similar)
-webhook event, this can be upgraded later: swap the scheduler tick for an inbound webhook
-call carrying the PO id, then fetch just that one PO instead of a filtered list. Everything
-downstream (idempotency check, mapping, push to Sage) stays the same.
+**Fallback if purchase orders aren't webhook-subscribable**: a scheduled poll (call the
+BigChange PO list endpoint filtered by `modifiedSince` every N minutes) — same downstream
+pipeline, just a different trigger.
 
 The integration service itself can now be a normal hosted service (cloud function or small
 container) — it doesn't need to live inside the customer's network, since the Sage 200
@@ -115,15 +126,22 @@ every request.
 
 ## Key design points
 
-- **Idempotency**: webhooks can fire more than once. Before creating a Sage PO, check a
-  small state store (even a simple table/file) keyed by BigChange PO id. If already
-  pushed, no-op.
+- **Idempotency**: BigChange retries webhook delivery on any non-2xx response (up to 24
+  hours), so duplicate deliveries are expected, not just theoretical. Before creating a
+  Sage PO, check a small state store (even a simple table/file) keyed by BigChange PO id.
+  If already pushed, no-op and still return 2xx.
+- **Respond fast, process async**: since BigChange retries on failure/timeout, the webhook
+  handler should acknowledge quickly (2xx) and do the Sage push in the background — a slow
+  Sage 200 API call blocking the webhook response risks BigChange treating it as a failed
+  delivery and retrying unnecessarily.
 - **Auth/secrets**: BigChange API key and Sage 200 OAuth2 client credentials are both
   secrets — environment variables / a secrets manager, never committed to the repo.
-- **Webhook verification**: if BigChange signs its webhook payloads (HMAC), verify the
-  signature before processing — otherwise the endpoint is spoofable.
-- **Error handling**: failed pushes (e.g. missing supplier mapping) go to a retry queue /
-  dead-letter log with alerting, rather than silently dropping the PO.
+- **Webhook verification**: needs confirming whether BigChange signs payloads (e.g. HMAC
+  header) — not seen in the reference docs so far. If not, rely on an unguessable endpoint
+  URL and/or IP allowlisting instead.
+- **Error handling**: failed pushes to Sage (e.g. missing supplier mapping) go to a retry
+  queue / dead-letter log with alerting, rather than silently dropping the PO. BigChange's
+  own FailedMessages endpoint is a useful secondary backstop for delivery-level failures.
 - **Traceability**: writing the resulting Sage200 PO number back to BigChange (custom
   field or note) closes the loop for whoever raised the PO.
 - **On-prem prerequisite**: someone (customer's IT or Sage partner) needs to set up the
@@ -137,10 +155,11 @@ every request.
 2. **Native API already set up?** — Confirmed as already configured on the customer's Sage
    200 site. Still need the actual OAuth2 client ID/secret from the Sage Developer account
    being created.
-3. **BigChange webhook support** — still unconfirmed. Their developer portal is blocked to
-   automated access; someone with portal login needs to check whether a
-   `PurchaseOrder.Created` (or similar) webhook event exists. Plan currently defaults to a
-   scheduled poll instead — this can be revisited later, it doesn't block Phase 1.
+3. **BigChange webhook support** — the webhook *mechanism* is confirmed (general
+   entity+operation subscriptions, e.g. `job.created`). What's still unconfirmed is whether
+   **purchase order** is one of the subscribable entities — check the entity dropdown in
+   API Key Management → Manage webhooks in the portal. If not available, fall back to a
+   scheduled poll (doesn't block Phase 1 either way).
 4. **Supplier & product mapping ownership** — who maintains the BigChange↔Sage200 code
    mapping tables, and how are they updated when new suppliers/products are added? (Now more
    concrete: this is a code/name → internal Sage numeric ID lookup, cached from `GET
