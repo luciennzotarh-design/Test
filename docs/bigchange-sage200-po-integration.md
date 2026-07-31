@@ -39,32 +39,44 @@ by the customer's IT/Sage partner.
 
 ## Architecture
 
+**Defaulting to a scheduled poll, not a webhook.** BigChange's developer portal is
+currently unreachable for verification (blocked automated access during research), and one
+of their own API doc pages is labelled "coming soon" — suggesting their REST API may still
+be in phased rollout and webhook coverage for purchase orders is unconfirmed. Separately,
+BigChange's "DaaS" offering does expose purchase order data, but it's explicitly
+**read-only batch reporting** via Snowflake — not usable for triggering pushes. Until
+someone with portal access confirms a `PurchaseOrder.Created` webhook event exists, the
+safer build target is a poll.
+
 ```mermaid
 sequenceDiagram
+    participant SCHED as Scheduler<br/>(every N minutes)
+    participant WH as Integration Service
     participant BC as BigChange
-    participant WH as Integration Service<br/>(webhook receiver)
     participant DB as Mapping/State Store
     participant SG as Sage 200 Professional<br/>(Native API, via Azure AD tunnel)
 
-    BC->>WH: Webhook: PurchaseOrder.Created (PO id)
-    WH->>BC: GET /purchaseorder/{id} (fetch full PO)
-    BC-->>WH: PO details (supplier, lines, job ref, costs)
-    WH->>DB: Check idempotency (already pushed?)
-    alt already pushed
-        WH-->>BC: Ack, no-op
-    else new PO
-        WH->>DB: Resolve supplier code, nominal codes, stock codes
-        WH->>SG: POST /pop_orders (mapped payload incl. lines[], OAuth2)
-        SG-->>WH: Created (Sage PO number)
-        WH->>DB: Store BigChange PO id <-> Sage PO number
-        WH->>BC: (optional) write Sage PO number back to a BigChange custom field
+    SCHED->>WH: Tick
+    WH->>BC: GET purchase orders modified since last run
+    BC-->>WH: List of PO details (supplier, lines, job ref, costs)
+    loop each PO
+        WH->>DB: Check idempotency (already pushed?)
+        alt already pushed
+            WH->>WH: Skip
+        else new PO
+            WH->>DB: Resolve supplier code, nominal codes, stock codes
+            WH->>SG: POST /pop_orders (mapped payload incl. lines[], OAuth2)
+            SG-->>WH: Created (Sage PO number)
+            WH->>DB: Store BigChange PO id <-> Sage PO number
+            WH->>BC: (optional) write Sage PO number back to a BigChange custom field
+        end
     end
 ```
 
-If BigChange turns out not to support a webhook event for purchase orders specifically
-(needs confirming against their developer portal — see Open Questions), fall back to a
-**scheduled poll**: every N minutes, call BigChange's PO list/search endpoint filtered by
-`modifiedSince`, and process anything new. The rest of the pipeline is unchanged.
+If it turns out BigChange **does** have a working `PurchaseOrder.Created` (or similar)
+webhook event, this can be upgraded later: swap the scheduler tick for an inbound webhook
+call carrying the PO id, then fetch just that one PO instead of a filtered list. Everything
+downstream (idempotency check, mapping, push to Sage) stays the same.
 
 The integration service itself can now be a normal hosted service (cloud function or small
 container) — it doesn't need to live inside the customer's network, since the Sage 200
@@ -125,9 +137,10 @@ every request.
 2. **Native API already set up?** — Confirmed as already configured on the customer's Sage
    200 site. Still need the actual OAuth2 client ID/secret from the Sage Developer account
    being created.
-3. **BigChange webhook support** — does BigChange's API expose a `PurchaseOrder.Created`
-   (or similar) webhook event, or does this need to be a scheduled poll instead? Check
-   `bigchange.com/rest-api` / the BigChange developer portal, or ask BigChange support.
+3. **BigChange webhook support** — still unconfirmed. Their developer portal is blocked to
+   automated access; someone with portal login needs to check whether a
+   `PurchaseOrder.Created` (or similar) webhook event exists. Plan currently defaults to a
+   scheduled poll instead — this can be revisited later, it doesn't block Phase 1.
 4. **Supplier & product mapping ownership** — who maintains the BigChange↔Sage200 code
    mapping tables, and how are they updated when new suppliers/products are added? (Now more
    concrete: this is a code/name → internal Sage numeric ID lookup, cached from `GET
