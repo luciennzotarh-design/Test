@@ -3,112 +3,133 @@
 ## Goal
 
 When a purchase order (PO) is created in BigChange (JobWatch), automatically create the
-matching purchase order in Sage200 — no manual re-keying.
+matching purchase order in Sage 200 Professional — no manual re-keying.
 
-## Open decision: which Sage200?
+## Confirmed: Sage 200 Professional
 
-This is the fork in the road and needs confirming before any code is written.
+This is the on-premise/desktop edition. It has **no public REST API** — that's Sage 200
+Standard only. This shapes the whole "push" side of the architecture:
 
-| | Sage 200 Standard (cloud) | Sage 200 Professional / Extra (on-prem) |
-|---|---|---|
-| API | Official REST API, OAuth 2.0, JSON (`developer.sage.com/200-uk`) | No public REST API. Access is via ODBC/OData connectors (e.g. CData), the Sage 200 Business Object model, or middleware (Codat etc.) |
-| Reachability | Public HTTPS endpoint — a cloud webhook receiver can call it directly | Sits inside the customer's network — the integration service must run on-prem or behind a VPN/gateway to reach it |
-| Effort | Lower — well-documented REST resource for purchase orders | Higher — likely needs a locally-installed connector/agent, or a third-party middleware subscription |
+| | Detail |
+|---|---|
+| Access method | **Sage 200 SDK / Business Object Model** — a .NET library that talks to Sage 200's own application layer (not raw SQL), so business rules, numbering, and validation are respected |
+| Where it must run | On a machine with the Sage 200 client components installed, on the same network as the Sage 200 SQL Server — it cannot be called over the public internet |
+| Third-party middleware | Ruled out — Codat and similar iPaaS tools only support Sage 200 Standard (cloud), not Professional/Extra |
+| Direct SQL writes | Not recommended — writing PO tables directly bypasses Sage's business logic (numbering, VAT, stock updates) and risks data corruption. Only use the SDK/Business Object Model for writes |
+| Licensing | The SDK connection may consume a **named user seat** — confirm with your Sage 200 reseller/partner before building, since an unattended integration user has a licensing cost |
 
-**Action needed:** confirm which one is in use (check the Sage200 login screen — a
-web URL means Standard; a desktop application means Professional/Extra) before Phase 1 below starts.
-Everything else in this plan assumes **Sage 200 Standard**, since that's the more common
-target for this kind of integration and the only one with a documented public API. If it
-turns out to be Professional, the "Push to Sage200" step changes but the rest of the
-pipeline (webhook receiver, mapping, idempotency) stays the same.
+## Architecture
 
-## Architecture (webhook-triggered)
+Because Sage 200 Professional can only be reached from inside its own network, and
+BigChange's webhook needs a public HTTPS endpoint to call, the two are bridged with a
+small **cloud relay** in the middle. The on-prem side only ever makes outbound calls —
+no inbound firewall rule needs opening on the customer's network.
 
 ```mermaid
 sequenceDiagram
     participant BC as BigChange
-    participant WH as Integration Service<br/>(webhook receiver)
-    participant DB as Mapping/State Store
-    participant SG as Sage200 API
+    participant RL as Cloud Relay<br/>(webhook receiver + queue)
+    participant AG as On-prem Agent<br/>(Windows service, polls outbound)
+    participant SDK as Sage 200 SDK
+    participant SG as Sage 200 Professional
 
-    BC->>WH: Webhook: PurchaseOrder.Created (PO id)
-    WH->>BC: GET /purchaseorder/{id} (fetch full PO)
-    BC-->>WH: PO details (supplier, lines, job ref, costs)
-    WH->>DB: Check idempotency (already pushed?)
+    BC->>RL: Webhook: PurchaseOrder.Created (PO id)
+    RL->>BC: GET /purchaseorder/{id} (fetch full PO)
+    BC-->>RL: PO details (supplier, lines, job ref, costs)
+    RL->>RL: Queue the PO payload
+    AG->>RL: Poll for pending POs (outbound HTTPS, every N seconds)
+    RL-->>AG: Pending PO payload
+    AG->>AG: Check idempotency (already pushed?)
     alt already pushed
-        WH-->>BC: Ack, no-op
+        AG->>RL: Ack, discard
     else new PO
-        WH->>DB: Resolve supplier code, nominal codes, stock codes
-        WH->>SG: POST /purchase_orders (mapped payload)
-        SG-->>WH: Created (Sage PO number)
-        WH->>DB: Store BigChange PO id <-> Sage PO number
-        WH->>BC: (optional) write Sage PO number back to a BigChange custom field
+        AG->>AG: Resolve supplier code, nominal codes, stock codes
+        AG->>SDK: Create PurchaseOrder object, set lines, Save()
+        SDK->>SG: Writes PO via Business Object Model
+        SG-->>AG: Created (Sage PO number)
+        AG->>RL: Report success + Sage PO number
+        RL->>BC: (optional) write Sage PO number back to a BigChange custom field
     end
 ```
 
-If BigChange turns out not to support a webhook event for purchase orders specifically
-(needs confirming against their developer portal — see Open Questions), fall back to a
-**scheduled poll**: every N minutes, call BigChange's PO list/search endpoint filtered by
-`modifiedSince`, and process anything new. The rest of the pipeline is unchanged.
+**Why not a direct webhook straight to the on-prem machine?** It would need the customer's
+firewall/router configured to accept inbound traffic from the internet to a Windows
+service — high IT friction and a bigger attack surface. Routing through a small cloud
+relay keeps BigChange's side genuinely event-driven while the on-prem agent stays
+outbound-only, which is normally an easy sell to IT.
+
+**Simpler fallback**: if a cloud relay is more infrastructure than wanted, the on-prem
+agent can instead poll BigChange's API directly on a schedule (e.g. every 5 minutes,
+filtered by `modifiedSince`) — no relay, no webhook, just one outbound-only service. Less
+real-time, but meaningfully simpler to operate. Worth considering as the actual Phase 1/2
+target unless near-real-time matters here.
 
 ## Data mapping (draft — needs field-level confirmation)
 
-| BigChange PO field | Sage200 PO field | Notes |
+| BigChange PO field | Sage 200 field (via SDK) | Notes |
 |---|---|---|
-| PO number / external ID | Order reference | Also stored as the idempotency key |
-| Supplier | Supplier account code | Requires a supplier mapping table — BigChange supplier ≠ Sage supplier account code by default |
-| Order lines (item, qty, unit cost) | Order lines (stock/product code, qty, unit price) | Requires a product/stock code mapping table |
+| PO number / external ID | Order reference / memo | Also stored as the idempotency key |
+| Supplier | Supplier account reference | Requires a supplier mapping table — BigChange supplier ≠ Sage account reference by default |
+| Order lines (item, qty, unit cost) | Order lines (stock code, qty, unit price) | Requires a product/stock code mapping table |
 | Job / site reference | Analysis code or order note | For cost-centre reporting back in Sage |
 | Delivery address | Delivery address | May default to a fixed warehouse/site address |
 | Nominal code (if set in BigChange) | Nominal code | Only if BigChange POs carry nominal coding; otherwise Sage's default per supplier/product applies |
 
 Suppliers and stock/product codes are assumed to **already exist in both systems** — this
 integration does not create master data, only transactional POs. A mapping table (BigChange
-ID → Sage200 code) is required for both suppliers and products before Phase 1 can run
-end-to-end.
+ID → Sage account reference / stock code) is required before Phase 1 can run end-to-end.
 
 ## Key design points
 
-- **Idempotency**: webhooks can fire more than once. Before creating a Sage PO, check a
-  small state store (even a simple table/file) keyed by BigChange PO id. If already
-  pushed, no-op.
-- **Auth**: BigChange API key/token and Sage200 OAuth2 client credentials are both secrets
-  — stored as environment variables / a secrets manager, never committed to the repo.
-- **Webhook verification**: if BigChange signs its webhook payloads (HMAC), verify the
-  signature before processing — otherwise the endpoint is spoofable.
+- **Idempotency**: the relay or a retry can cause the same PO to be seen twice. Before
+  creating a Sage PO, check a small state store (even a simple table/file) keyed by
+  BigChange PO id. If already pushed, no-op.
+- **Auth/secrets**: BigChange API key and the Sage 200 SDK connection credentials are both
+  secrets — environment variables / a secrets manager on the on-prem machine, never
+  committed to the repo.
+- **Webhook verification**: if BigChange signs its webhook payloads (HMAC), the relay must
+  verify the signature before queueing — otherwise the endpoint is spoofable.
 - **Error handling**: failed pushes (e.g. missing supplier mapping) go to a retry queue /
-  dead-letter log with alerting, rather than silently dropping the PO.
-- **Traceability**: writing the resulting Sage200 PO number back to BigChange (custom
-  field or note) closes the loop for whoever raised the PO.
+  dead-letter log with alerting, rather than silently dropping the PO. The on-prem agent
+  should log failures somewhere the customer's IT/finance team can actually see.
+- **Traceability**: writing the resulting Sage PO number back to BigChange (custom field or
+  note) closes the loop for whoever raised the PO.
+- **.NET Framework**: the Sage 200 SDK is COM/.NET-Framework based (not .NET Core/5+), so
+  the on-prem agent is realistically a Windows service written in C# targeting .NET
+  Framework, deployed to a Windows machine with Sage 200 client components installed.
 
 ## Open questions to resolve before building
 
-1. **Sage200 variant** — Standard (cloud API) or Professional/Extra (on-prem)? Determines
-   the entire "push" side of the architecture.
-2. **BigChange webhook support** — does BigChange's API expose a `PurchaseOrder.Created`
+1. **On-prem hosting** — which Windows machine (server or a dedicated workstation) will
+   run the agent, and does it have (or can it get) the Sage 200 client/SDK installed with
+   network access to the Sage 200 SQL Server?
+2. **SDK licensing** — does the integration need a dedicated named-user seat, and is one
+   available/budgeted?
+3. **BigChange webhook support** — does BigChange's API expose a `PurchaseOrder.Created`
    (or similar) webhook event, or does this need to be a scheduled poll instead? Check
    `bigchange.com/rest-api` / the BigChange developer portal, or ask BigChange support.
-3. **Supplier & product mapping ownership** — who maintains the BigChange↔Sage200 code
+4. **Relay vs. simple poll** — is near-real-time worth the extra cloud relay component, or
+   is a straightforward "on-prem agent polls BigChange every few minutes" acceptable?
+5. **Supplier & product mapping ownership** — who maintains the BigChange↔Sage200 code
    mapping tables, and how are they updated when new suppliers/products are added?
-4. **Nominal coding** — does BigChange capture nominal codes on a PO, or does Sage200's
+6. **Nominal coding** — does BigChange capture nominal codes on a PO, or does Sage's
    default coding per supplier/product apply?
-5. **Hosting** — where does the integration service run? (Cloud function is simplest for
-   Sage 200 Standard; if Sage200 Professional, likely needs to run inside the customer's
-   network.)
-6. **Credentials** — confirm both a BigChange API key and a registered Sage200 API
-   application (client id/secret) are available.
+7. **Credentials** — confirm a BigChange API key and valid Sage 200 SDK/login credentials
+   are available for the integration user.
 
 ## Suggested phased rollout
 
-1. **Phase 1 — manual/poll proof of concept**: a script that reads one known BigChange PO
-   and creates the matching Sage200 PO via a one-off run. Validates field mapping and
-   both APIs' auth without needing a hosted webhook endpoint yet.
-2. **Phase 2 — automate the trigger**: move to a real webhook (or scheduled poll) with
-   idempotency and error handling.
-3. **Phase 3 — monitoring & reconciliation**: alerting on failed pushes, a daily
+1. **Phase 1 — local proof of concept**: a small C# console app on the Sage 200 machine
+   using the SDK to create one hardcoded test PO. Validates SDK credentials, licensing, and
+   the exact Business Object Model calls needed — before any BigChange involvement.
+2. **Phase 2 — connect BigChange**: add the BigChange fetch (poll or webhook-via-relay) and
+   field mapping, still run manually/on-demand.
+3. **Phase 3 — automate + harden**: turn it into a proper Windows service with idempotency,
+   retry/error handling, and logging.
+4. **Phase 4 — monitoring & reconciliation**: alerting on failed pushes, a daily
    reconciliation report comparing BigChange POs to Sage200 POs to catch anything missed.
 
 ## Next step
 
-Once questions 1–3 above are answered, Phase 1 can be scaffolded as working code
-(BigChange fetch + Sage200 push script) in this repo.
+Decide question 4 (relay vs. simple poll) and question 1 (hosting machine) — those two
+determine what Phase 1 actually needs to be scaffolded as in this repo.
