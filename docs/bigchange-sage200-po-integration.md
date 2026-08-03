@@ -49,6 +49,7 @@ From the actual API reference (`developers.bigchange.com`):
 | Create/Update | `POST` / `PUT` on the same `purchaseOrders` collection also exist (confirmed via the nav: "Create an purchase order", "Update a purchase order") — not needed for this integration since we only read from BigChange, but useful to know if the write-back-of-status idea gets built later |
 | Auth | `Authorization: Bearer <token>` **and** a required `Customer-Id: <id>` header on every request — not just the token |
 | Line items | **Separate resource**, not embedded in the PO response — `GET`/`POST`/`PUT`/`DELETE` line-item endpoints exist under the purchase order: `/v1/finance/purchaseorders/{id}/lineItems` |
+| Resolving supplier names | `supplierId` (and `contactId`) on a PO both appear to reference **Contacts** — `GET /v1/contacts/{contactId}` (base path `/v1/contacts`, **not** under `/finance/`; scope `contacts:read`) returns `name`, address, `accountStatus`. Needed to turn a bare `supplierId` number into an actual company name for the mapping table |
 
 **Confirmed PO header fields** (from the `GET` response schema):
 
