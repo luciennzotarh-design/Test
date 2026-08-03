@@ -170,6 +170,27 @@ can be set up once as static config rather than looked up dynamically per push.
 build a working line payload), and whether BigChange signs webhook payloads. Both are
 small, targeted checks rather than open architecture questions at this point.
 
+### Building the supplier mapping table
+
+Pulled a real page of production data from `GET /v1/finance/purchaseOrders` (100 POs) to
+gauge scope: roughly **20 distinct `supplierId` values** on that single page alone (more
+likely exist across other pages), with one supplier ID appearing far more often than any
+other — the natural first candidate for a mapping row. (Raw production data — supplier
+IDs, job references, customer details — deliberately not copied into this repo; kept to
+chat/working notes instead.)
+
+To build the mapping table for real:
+1. For each distinct BigChange `supplierId`, look up its name (via BigChange's
+   Contacts/supplier lookup — not yet confirmed which endpoint holds supplier names, since
+   `purchaseOrders` only returns the numeric ID).
+2. Match each name against Sage 200's supplier list (desktop client, or `GET /suppliers`
+   once OAuth2 credentials are available) to get the Sage account code/internal ID.
+3. Record each pair in the mapping config.
+
+**For Phase 1**, only one row is needed: the single most-frequent supplier, matched to its
+Sage counterpart — enough to validate the full pipeline end-to-end on a realistic, common
+case before investing in mapping the full supplier list.
+
 ## Key design points
 
 - **Idempotency**: BigChange retries webhook delivery on any non-2xx response (up to 24
