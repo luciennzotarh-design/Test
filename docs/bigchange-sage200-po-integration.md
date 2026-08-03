@@ -45,9 +45,10 @@ From the actual API reference (`developers.bigchange.com`):
 |---|---|
 | Base URL | `https://api.bigchange.com/v1` |
 | Get one PO | `GET /v1/finance/purchaseOrders/{purchaseOrderId}` (scope `finance:read`) |
+| List POs | `GET /v1/finance/purchaseOrders` — filters: `id[]`, `jobId[]`, `jobGroupId[]`, `contactId[]`, `reference[]`, `createdAtFrom/To`; sort by `createdAt`/`reference`; paged up to 1000/page. No `supplierId` filter, only `contactId`. Confirms `purchaseOrders` (capital O) is the real path — the lowercase variant seen on the line-items page was likely just a docs typo |
 | Create/Update | `POST` / `PUT` on the same `purchaseOrders` collection also exist (confirmed via the nav: "Create an purchase order", "Update a purchase order") — not needed for this integration since we only read from BigChange, but useful to know if the write-back-of-status idea gets built later |
 | Auth | `Authorization: Bearer <token>` **and** a required `Customer-Id: <id>` header on every request — not just the token |
-| Line items | **Separate resource**, not embedded in the PO response — `GET`/`POST`/`PUT`/`DELETE` line-item endpoints exist under the purchase order (exact path not yet pulled, but the pattern from other resources is `/v1/finance/purchaseOrders/{id}/lineItems`) |
+| Line items | **Separate resource**, not embedded in the PO response — `GET`/`POST`/`PUT`/`DELETE` line-item endpoints exist under the purchase order: `/v1/finance/purchaseorders/{id}/lineItems` |
 
 **Confirmed PO header fields** (from the `GET` response schema):
 
